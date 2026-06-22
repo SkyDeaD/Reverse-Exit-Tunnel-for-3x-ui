@@ -48,14 +48,16 @@ Client → [Entry Server: 3x-ui inbound] → [socat relay] ──WireGuard──
 │  ┌────────────────────────────────────────────────────────────┐     │
 │  │                  Docker: 3x-ui / Xray                      │     │
 │  │                                                            │     │
-│  │  [inbound: INBOUND_TAG] ──routing rule──► [uz-exit]       │     │
+│  │  [inbound: INBOUND_TAG] ──routing rule──► [uz-exit]        │     │
 │  │                             (SOCKS5 outbound               │     │
 │  │                              DOCKER_GATEWAY:RELAY_PORT)    │     │
 │  └───────────────────────┬────────────────────────────────────┘     │
 │                          │  Docker bridge network                   │
 │                          ▼                                          │
 │               socat relay (systemd)                                 │
-│               DOCKER_GATEWAY:RELAY_PORT ──────────────────────►    │
+│               DOCKER_GATEWAY:RELAY_PORT ─────────────┐              │
+│                                                      │              │
+│                                                      ▼              │
 │                                             WireGuard (wg-server)   │
 │                                             WG_SERVER_ADDR:51820    │
 └─────────────────────────────────────────────────────────────────────┘
@@ -65,10 +67,10 @@ Client → [Entry Server: 3x-ui inbound] → [socat relay] ──WireGuard──
                                              │
                                              ▼
                              ┌──────────────────────────────┐
-                             │         Exit Node             │
+                             │         Exit Node            │
                              │                              │
                              │  wg0: WG_CLIENT_ADDR         │
-                             │  microsocks: PROXY_PORT       │
+                             │  microsocks: PROXY_PORT      │
                              └───────────────┬──────────────┘
                                              │
                                              ▼
