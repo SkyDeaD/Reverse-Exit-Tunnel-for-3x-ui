@@ -46,16 +46,18 @@
 │                    Основной сервер (VPS)                            │
 │                                                                     │
 │  ┌────────────────────────────────────────────────────────────┐     │
-│  │               Docker контейнер: 3x-ui / Xray              │     │
+│  │               Docker контейнер: 3x-ui / Xray               │     │
 │  │                                                            │     │
-│  │  [inbound: INBOUND_TAG] ──routing rule──► [remote-exit]  │     │
+│  │  [inbound: INBOUND_TAG] ──routing rule──► [remote-exit]    │     │
 │  │                             (SOCKS5 outbound               │     │
 │  │                              DOCKER_GATEWAY:RELAY_PORT)    │     │
 │  └───────────────────────┬────────────────────────────────────┘     │
 │                          │  Docker bridge сеть                      │
 │                          ▼                                          │
-│               socat relay (systemd, на хосте)                      │
-│               DOCKER_GATEWAY:RELAY_PORT ──────────────────────►    │
+│               socat relay (systemd, на хосте)                       │
+│               DOCKER_GATEWAY:RELAY_PORT ──────────────┐             │
+│                                                       │             │
+│                                                       ▼             │
 │                                             WireGuard (wg-server)   │
 │                                             :51820/udp              │
 └─────────────────────────────────────────────────────────────────────┘
@@ -65,10 +67,10 @@
                                              │
                                              ▼
                              ┌──────────────────────────────┐
-                             │        Узел выхода            │
+                             │        Узел выхода           │
                              │                              │
                              │  wg0: WG_CLIENT_ADDR         │
-                             │  microsocks: PROXY_PORT       │
+                             │  microsocks: PROXY_PORT      │
                              └───────────────┬──────────────┘
                                              │
                                              ▼
