@@ -4,11 +4,12 @@
 
 **Маршрутизация трафика через удалённый узел без белого IP**
 
-*WireGuard · microsocks · socat · Docker · 3x-ui*
+*WireGuard · SSH Reverse Tunnel · microsocks · socat · Docker · 3x-ui*
 
 <br>
 
 [![WireGuard](https://img.shields.io/badge/WireGuard-88171A?style=flat-square&logo=wireguard&logoColor=white)](https://www.wireguard.com/)
+[![OpenSSH](https://img.shields.io/badge/OpenSSH-black?style=flat-square&logo=openssh&logoColor=white)](https://www.openssh.com/)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu_22.04+-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![3x-ui](https://img.shields.io/badge/3x--ui-latest-blue?style=flat-square)](https://github.com/MHSanaei/3x-ui)
@@ -23,136 +24,141 @@
 
 ---
 
-## 📖 Описание задачи
+## 📖 Описание
 
-**Проблема:** 3x-ui работает в Docker на VPS. Нужно, чтобы трафик определённого inbound выходил в интернет через другую машину — у которой **нет статического или белого IP**.
+**Проблема:** 3x-ui работает в Docker на VPS (Основной сервер). Нужно, чтобы трафик определённого inbound выходил через другую машину (Узел выхода) — у которой **нет статического или белого IP**.
 
-**Решение:** Узел выхода сам инициирует WireGuard туннель к основному серверу. Xray маршрутизирует выбранные inbound через `socat` relay → WireGuard → `microsocks` на узле выхода.
+**Решение:** Узел выхода сам инициирует туннель к Основному серверу. Xray маршрутизирует нужные inbound через `socat` relay → туннель → `microsocks` на Узле выхода.
 
-```
-Клиент → [Основной сервер: 3x-ui inbound] → [socat relay] ──WireGuard──► [Узел выхода: microsocks] → Интернет
-```
+Рассматриваются два варианта туннеля:
 
-> [!NOTE]
-> Узел выхода никогда не принимает входящие соединения снаружи.  
-> Он сам инициирует туннель — NAT, CGNAT, динамический IP: всё работает.
+| | Решение А · WireGuard | Решение Б · SSH Reverse |
+|---|---|---|
+| **Подходит для** | Домашний сервер, VPS, свободная сеть | Корпоративная сеть, NAT, жёсткий firewall |
+| **Протокол** | UDP | TCP |
+| **Порт на Основном сервере** | 51820/UDP | 22/TCP (уже открыт) |
+| **Стабильность** | ★★★★★ | ★★★★☆ |
+| **Сложность настройки** | Средняя | Низкая |
+| **Чувствительность к firewall** | Высокая (UDP может блокироваться) | Низкая (TCP 22 проходит везде) |
+
+> [!TIP]
+> **Не знаешь что выбрать?** Начни с Решения А. Если WireGuard handshake не устанавливается (0 пакетов на Узле выхода) — сеть блокирует UDP. Переходи на Решение Б.
 
 ---
 
-## 🏗️ Архитектура
+## 🔀 Архитектура
+
+### Решение А — WireGuard
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Основной сервер (VPS)                            │
-│                                                                     │
-│  ┌────────────────────────────────────────────────────────────┐     │
-│  │               Docker контейнер: 3x-ui / Xray               │     │
-│  │                                                            │     │
-│  │  [inbound: INBOUND_TAG] ──routing rule──► [remote-exit]    │     │
-│  │                             (SOCKS5 outbound               │     │
-│  │                              DOCKER_GATEWAY:RELAY_PORT)    │     │
-│  └───────────────────────┬────────────────────────────────────┘     │
-│                          │  Docker bridge сеть                      │
-│                          ▼                                          │
-│               socat relay (systemd, на хосте)                       │
-│               DOCKER_GATEWAY:RELAY_PORT ──────────────┐             │
-│                                                       │             │
-│                                                       ▼             │
-│                                             WireGuard (wg-server)   │
-│                                             :51820/udp              │
-└─────────────────────────────────────────────────────────────────────┘
-                                             │
-                                  WireGuard туннель (UDP)
-                                  Узел выхода инициирует соединение
-                                             │
-                                             ▼
-                             ┌──────────────────────────────┐
-                             │        Узел выхода           │
-                             │                              │
-                             │  wg0: WG_CLIENT_ADDR         │
-                             │  microsocks: PROXY_PORT      │
-                             └───────────────┬──────────────┘
-                                             │
-                                             ▼
-                                    Интернет (IP узла выхода)
+┌──────────────────────────────────────────────────────────┐
+│               Основной сервер (VPS)                      │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │           Docker: 3x-ui / Xray                     │  │
+│  │  [inbound] ──routing──► [remote-exit outbound]     │  │
+│  │                         DOCKER_GATEWAY:10800        │  │
+│  └─────────────────┬──────────────────────────────────┘  │
+│                    │ Docker bridge                       │
+│                    ▼                                     │
+│         socat relay (хост)                              │
+│         DOCKER_GATEWAY:10800 ──► 10.99.0.2:10800       │
+│                                  │                      │
+│         WireGuard wg-server      │                      │
+│         слушает :51820/udp ◄─────┘ (WG туннель)        │
+└──────────────────────────────────────────────────────┬──┘
+                                                       │ WireGuard UDP
+                                                       │ Узел выхода инициирует
+                                                       ▼
+                                       ┌───────────────────────┐
+                                       │     Узел выхода       │
+                                       │  wg0: 10.99.0.2       │
+                                       │  microsocks :10800     │
+                                       └──────────┬────────────┘
+                                                  │
+                                                  ▼
+                                          Интернет (IP узла выхода)
 ```
 
-### Путь трафика
+### Решение Б — SSH Reverse Tunnel
 
 ```
-Клиент
-  │  подключается к inbound на основном сервере
-  ▼
-3x-ui inbound  (тег: INBOUND_TAG)
-  │  routing rule → outbound: remote-exit
-  ▼
-SOCKS5 outbound → DOCKER_GATEWAY:RELAY_PORT
-  │  Docker bridge
-  ▼
-socat relay  (запущен на хосте VPS, не в контейнере)
-  │  WireGuard туннель
-  ▼
-microsocks  (Узел выхода: WG_CLIENT_ADDR:PROXY_PORT)
-  │
-  ▼
-Интернет  ← IP = IP узла выхода ✓
+┌──────────────────────────────────────────────────────────┐
+│               Основной сервер (VPS)                      │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │           Docker: 3x-ui / Xray                     │  │
+│  │  [inbound] ──routing──► [remote-exit outbound]     │  │
+│  │                         DOCKER_GATEWAY:10800        │  │
+│  └─────────────────┬──────────────────────────────────┘  │
+│                    │ Docker bridge                       │
+│                    ▼                                     │
+│         socat relay (хост)                              │
+│         DOCKER_GATEWAY:10800 ──► 127.0.0.1:10800       │
+│                                  │                      │
+│         sshd открывает 127.0.0.1:10800 ◄── SSH туннель │
+└──────────────────────────────────────────────────────┬──┘
+                                                       │ SSH TCP (порт 22)
+                                                       │ Узел выхода инициирует
+                                                       ▼
+                                       ┌───────────────────────┐
+                                       │     Узел выхода       │
+                                       │  autossh reverse fwd  │
+                                       │  microsocks :10800     │
+                                       │  (только 127.0.0.1)   │
+                                       └──────────┬────────────┘
+                                                  │
+                                                  ▼
+                                          Интернет (IP узла выхода)
 ```
 
 ---
 
 ## ✅ Требования
 
-| Компонент | Где | Что нужно |
-|-----------|-----|-----------|
-| **Основной сервер** | VPS с публичным IP | Ubuntu 22.04+, Docker, 3x-ui запущен |
-| **Узел выхода** | Любая машина | Ubuntu 22.04+, доступ в интернет, **белый IP не нужен** |
-
-> [!IMPORTANT]
-> На основном сервере должен быть открыт **UDP порт 51820** (WireGuard).
+| | Основной сервер | Узел выхода |
+|---|---|---|
+| **ОС** | Ubuntu 22.04+ | Ubuntu 22.04+ |
+| **Сеть** | Публичный IP, Docker + 3x-ui запущен | Только выход в интернет |
+| **Открытые порты** | 22/TCP, 443/TCP + **51820/UDP** *(только WG)* | Не нужны |
 
 ---
 
 ## 📋 Справочник переменных
 
-Замени эти плейсхолдеры на реальные значения по ходу гайда:
-
 | Переменная | Описание | Как найти |
 |-----------|----------|-----------|
-| `YOUR_VPS_IP` | Публичный IP основного сервера | `curl ifconfig.me` на основном сервере |
-| `DOCKER_GATEWAY` | Gateway Docker bridge сети | `docker exec <контейнер> ip route \| grep default` |
+| `YOUR_VPS_IP` | Публичный IP основного сервера | `curl ifconfig.me` |
+| `DOCKER_GATEWAY` | Gateway Docker bridge сети | `docker exec <контейнер> ip route \| grep default` → второе поле |
 | `BR_IFACE` | Имя Docker bridge интерфейса | `ip link show \| grep br-` |
-| `WG_SERVER_ADDR` | WireGuard IP основного сервера | Используй `10.99.0.1` (пример) |
-| `WG_CLIENT_ADDR` | WireGuard IP узла выхода | Используй `10.99.0.2` (пример) |
-| `PROXY_PORT` | Порт microsocks | Используй `10800` (пример) |
-| `INBOUND_TAG` | Тег inbound в 3x-ui | Виден в JSON конфиге Xray |
-| `OUTBOUND_TAG` | Имя нового outbound | Используй `remote-exit` (пример) |
+| `INBOUND_TAG` | Тег inbound в 3x-ui | Виден в JSON конфиге Xray, например `inbound-1080` |
 
 <details>
 <summary>💡 Как найти DOCKER_GATEWAY и BR_IFACE</summary>
 
 ```bash
-# Найти Docker gateway (выполнить на основном сервере)
+# DOCKER_GATEWAY — выполнить на основном сервере
 docker exec <имя-контейнера-3x-ui> ip route | grep default
-# Пример вывода: default via 172.19.0.1 dev eth0
-#                                ^^^^^^^^^^^ это и есть DOCKER_GATEWAY
+# Пример: default via 172.19.0.1 dev eth0
+#                     ^^^^^^^^^^ = DOCKER_GATEWAY
 
-# Найти имя bridge интерфейса
-docker network ls
-docker network inspect <имя-сети-compose> | grep Subnet
-ip link show | grep br-
-# Сопоставь ID сети из 'docker network ls' с интерфейсом br-XXXXXXXXX
+# BR_IFACE — сопоставить по имени сети
+docker network ls                                          # найти сеть compose
+docker network inspect <имя-сети> | grep Subnet           # подтвердить подсеть
+ip link show | grep br-                                    # br-XXXXXXXX = BR_IFACE
 ```
 
 </details>
 
 ---
 
-## 🚀 Установка
+## 🛡️ Решение А: WireGuard
 
-### Шаг 1 — Основной сервер: WireGuard
+> Используй когда Узел выхода на домашней сети, VPS или любой сети без блокировки UDP.
+
+### А1 — Основной сервер: WireGuard сервер
 
 ```bash
-# Установка
 sudo apt update && sudo apt install -y wireguard
 
 # Генерация ключей
@@ -162,15 +168,13 @@ sudo bash -c "
   chmod 600 server_private.key
 "
 
-# Публичный ключ основного сервера — скопируй, нужен для узла выхода
+# Публичный ключ — скопируй, нужен для Узла выхода (Шаг А2)
 sudo cat /etc/wireguard/server_public.key
 ```
 
-Создать `/etc/wireguard/wg-server.conf`:
-
 ```bash
+# Создать конфиг
 SERVER_PRIVKEY=$(sudo cat /etc/wireguard/server_private.key)
-
 sudo bash -c "cat > /etc/wireguard/wg-server.conf << EOF
 [Interface]
 PrivateKey = ${SERVER_PRIVKEY}
@@ -178,29 +182,19 @@ Address = 10.99.0.1/24
 ListenPort = 51820
 
 [Peer]
-# Узел выхода — PublicKey заполним после Шага 2
+# Заполнить после Шага А2
 PublicKey = PLACEHOLDER
 AllowedIPs = 10.99.0.2/32
 PersistentKeepalive = 25
 EOF"
 
-# Проверить конфиг
-sudo cat /etc/wireguard/wg-server.conf
-```
-
-```bash
-# Открыть порт
 sudo ufw allow 51820/udp
-
-# WireGuard пока НЕ запускаем — нужен публичный ключ узла выхода
+# Пока не запускаем — нужен ключ Узла выхода
 ```
 
----
-
-### Шаг 2 — Узел выхода: WireGuard + microsocks
+### А2 — Узел выхода: WireGuard клиент + microsocks
 
 ```bash
-# Установка
 sudo apt update && sudo apt install -y wireguard microsocks
 
 # Генерация ключей
@@ -210,38 +204,33 @@ sudo bash -c "
   chmod 600 client_private.key
 "
 
-# Публичный ключ узла выхода — скопируй на основной сервер
+# Публичный ключ — скопируй на Основной сервер
 sudo cat /etc/wireguard/client_public.key
 ```
 
-Создать `/etc/wireguard/wg0.conf`:
-
 ```bash
+# Создать конфиг WireGuard
 CLIENT_PRIVKEY=$(sudo cat /etc/wireguard/client_private.key)
-
 sudo bash -c "cat > /etc/wireguard/wg0.conf << EOF
 [Interface]
 PrivateKey = ${CLIENT_PRIVKEY}
 Address = 10.99.0.2/24
 
 [Peer]
-PublicKey = ВСТАВИТЬ_PUBLIC_KEY_ОСНОВНОГО_СЕРВЕРА
+PublicKey = PUBLIC_KEY_ОСНОВНОГО_СЕРВЕРА
 Endpoint = YOUR_VPS_IP:51820
 AllowedIPs = 10.99.0.1/32
 PersistentKeepalive = 25
 EOF"
 
-# Вставить реальные значения
-sudo nano /etc/wireguard/wg0.conf
-# Заменить: ВСТАВИТЬ_PUBLIC_KEY_ОСНОВНОГО_СЕРВЕРА и YOUR_VPS_IP
+sudo nano /etc/wireguard/wg0.conf  # вставить реальные значения
 ```
 
-Создать systemd сервис для microsocks:
-
 ```bash
+# microsocks — слушает на WireGuard интерфейсе
 sudo tee /etc/systemd/system/microsocks.service << 'EOF'
 [Unit]
-Description=microsocks SOCKS5 прокси для обратного туннеля
+Description=microsocks SOCKS5 прокси (WireGuard)
 After=wg-quick@wg0.service
 Requires=wg-quick@wg0.service
 
@@ -256,106 +245,48 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable wg-quick@wg0
-sudo systemctl enable microsocks
-# Пока не запускаем — сначала обмен ключами
+sudo systemctl enable wg-quick@wg0 microsocks
 ```
 
----
-
-### Шаг 3 — Обмен ключами
-
-**На основном сервере** — вставить публичный ключ узла выхода:
+### А3 — Обмен ключами
 
 ```bash
-EXIT_PUBKEY="ВСТАВЬ_СЮДА_PUBLIC_KEY_УЗЛА_ВЫХОДА"
-
-sudo sed -i \
-  "s|PublicKey = PLACEHOLDER|PublicKey = ${EXIT_PUBKEY}|" \
+# На Основном сервере — вставить публичный ключ Узла выхода
+EXIT_PUBKEY="ВСТАВЬ_КЛЮЧ_УЗЛА_ВЫХОДА"
+sudo sed -i "s|PublicKey = PLACEHOLDER|PublicKey = ${EXIT_PUBKEY}|" \
   /etc/wireguard/wg-server.conf
-
-# Проверить результат
-sudo cat /etc/wireguard/wg-server.conf
+sudo cat /etc/wireguard/wg-server.conf  # проверить
 ```
 
-Ожидаемый итоговый конфиг основного сервера:
-
-```ini
-[Interface]
-PrivateKey = <приватный ключ основного сервера>
-Address = 10.99.0.1/24
-ListenPort = 51820
-
-[Peer]
-PublicKey = <публичный ключ узла выхода>
-AllowedIPs = 10.99.0.2/32
-PersistentKeepalive = 25
-```
-
----
-
-### Шаг 4 — Запуск туннеля
-
-**На основном сервере:**
+### А4 — Запуск и проверка туннеля
 
 ```bash
+# Основной сервер
 sudo systemctl enable --now wg-quick@wg-server
-sudo wg show wg-server
-```
 
-**На узле выхода:**
-
-```bash
+# Узел выхода
 sudo systemctl start wg-quick@wg0
 sudo systemctl start microsocks
-
-# Проверить WireGuard интерфейс
-ip addr show wg0
-# Ожидаемо: inet 10.99.0.2/24
-
-# Проверить microsocks
-ss -tlnp | grep 10800
-# Ожидаемо: 10.99.0.2:10800  LISTEN
 ```
 
-**Проверка туннеля (с основного сервера):**
-
 ```bash
-# 1. Появился handshake?
-sudo wg show wg-server
-# Ищи: latest handshake: X seconds ago ✓
-
-# 2. Пинг до узла выхода
-ping -c3 10.99.0.2
-
-# 3. Главная проверка — трафик выходит через IP узла выхода?
-curl --socks5 10.99.0.2:10800 https://api.ipify.org
-# ✓ Должен вернуть IP узла выхода, а не IP основного сервера
+# Проверка с Основного сервера — все три должны пройти:
+sudo wg show wg-server                                   # latest handshake: X seconds ago ✓
+curl --socks5 10.99.0.2:10800 https://api.ipify.org     # должен вернуть IP узла выхода ✓
 ```
 
 > [!WARNING]
-> Если проверка №3 не прошла — туннель сломан. Не продолжай.  
-> Смотри раздел [Устранение неполадок](#-устранение-неполадок).
+> Если handshake есть но `curl` зависает, а `tcpdump -i wg0` на Узле выхода показывает 0 пакетов — сеть блокирует входящий UDP. Переходи на **Решение Б**.
 
----
-
-### Шаг 5 — Основной сервер: socat relay
-
-Мост между Docker сетью (`DOCKER_GATEWAY`) и WireGuard (`WG_CLIENT_ADDR`).
-
-```
-Docker контейнер → DOCKER_GATEWAY:10800 ──socat──► 10.99.0.2:10800 → microsocks
-```
+### А5 — socat relay (Основной сервер)
 
 ```bash
 sudo apt install -y socat
-```
 
-```bash
-# Замени 172.19.0.1 на твой реальный DOCKER_GATEWAY
+# Замени 172.19.0.1 на свой DOCKER_GATEWAY
 sudo tee /etc/systemd/system/exit-relay.service << 'EOF'
 [Unit]
-Description=socat relay: Docker bridge → WireGuard → microsocks узла выхода
+Description=socat: Docker bridge → WireGuard → microsocks Узла выхода
 After=wg-quick@wg-server.service
 Requires=wg-quick@wg-server.service
 
@@ -373,45 +304,164 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now exit-relay
 
-# Проверить что relay слушает
-ss -tlnp | grep 10800
-# Ожидаемо: 172.19.0.1:10800  LISTEN  socat
+ss -tlnp | grep 10800  # должно быть 172.19.0.1:10800 LISTEN
 ```
 
 ---
 
-### Шаг 6 — UFW: разрешить Docker → relay
+## 🔑 Решение Б: SSH Reverse Tunnel
 
-По умолчанию `deny (incoming)` в ufw блокирует трафик из Docker контейнера на `DOCKER_GATEWAY:10800`.
+> Используй когда Узел выхода за корпоративным firewall, строгим NAT или любой сетью, блокирующей UDP.
+
+### Б1 — Узел выхода: SSH ключ
+
+```bash
+# Установка пакетов
+sudo apt update && sudo apt install -y autossh microsocks
+
+# Генерация выделенного SSH ключа для туннеля
+ssh-keygen -t ed25519 -f ~/.ssh/entry_tunnel -N ""
+
+# Публичный ключ — скопируй на Основной сервер (Шаг Б2)
+cat ~/.ssh/entry_tunnel.pub
+```
+
+### Б2 — Основной сервер: авторизация ключа
+
+```bash
+# Добавить публичный ключ Узла выхода
+echo "ВСТАВЬ_ПУБЛИЧНЫЙ_КЛЮЧ_УЗЛА_ВЫХОДА" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+
+# Проверить SSH соединение вручную перед следующим шагом:
+# ssh -i ~/.ssh/entry_tunnel ubuntu@YOUR_VPS_IP
+```
+
+> [!NOTE]
+> `GatewayPorts` в sshd_config **не нужен** — socat подключается к `127.0.0.1:10800` на том же хосте где работает sshd.
+
+### Б3 — Узел выхода: microsocks + autossh
+
+```bash
+# microsocks только на localhost (не выставляется наружу)
+sudo tee /etc/systemd/system/microsocks.service << 'EOF'
+[Unit]
+Description=microsocks SOCKS5 прокси (SSH туннель)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p 10800
+Restart=always
+RestartSec=5
+User=nobody
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+```bash
+# autossh — обратный туннель
+# Замени YOUR_VPS_IP и ubuntu на реальные значения
+sudo tee /etc/systemd/system/ssh-tunnel.service << 'EOF'
+[Unit]
+Description=SSH обратный туннель к Основному серверу
+After=network.target microsocks.service
+Wants=microsocks.service
+
+[Service]
+User=ubuntu
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o "ServerAliveInterval=10" \
+  -o "ServerAliveCountMax=3" \
+  -o "ExitOnForwardFailure=yes" \
+  -o "StrictHostKeyChecking=no" \
+  -i /home/ubuntu/.ssh/entry_tunnel \
+  -R 10800:127.0.0.1:10800 \
+  ubuntu@YOUR_VPS_IP
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now microsocks
+sudo systemctl enable --now ssh-tunnel
+```
+
+### Б4 — Основной сервер: socat relay
+
+```bash
+sudo apt install -y socat
+
+# Замени 172.19.0.1 на свой DOCKER_GATEWAY
+# Цель — 127.0.0.1 (SSH туннель), а не 10.99.0.2
+sudo tee /etc/systemd/system/exit-relay.service << 'EOF'
+[Unit]
+Description=socat: Docker bridge → SSH туннель → microsocks Узла выхода
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/socat \
+  TCP-LISTEN:10800,bind=172.19.0.1,fork,reuseaddr \
+  TCP:127.0.0.1:10800
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now exit-relay
+
+ss -tlnp | grep 10800  # должно быть 172.19.0.1:10800 LISTEN
+```
+
+### Б5 — Проверка SSH туннеля
+
+```bash
+# Основной сервер — порт SSH туннеля должен появиться в течение нескольких секунд
+ss -tlnp | grep 10800
+# Ожидаемо: 127.0.0.1:10800  LISTEN  (открыт sshd)
+
+# Полная проверка цепочки
+curl --socks5 127.0.0.1:10800 https://api.ipify.org
+# ✓ Должен вернуть IP Узла выхода
+```
+
+---
+
+## ⚙️ Общее: UFW правило (оба решения)
+
+Docker контейнер не может достучаться до `DOCKER_GATEWAY:10800` без явного правила UFW.
 
 ```bash
 # Найти bridge интерфейс Docker сети
 docker network ls
 docker network inspect <имя-сети-compose> | grep Subnet
 ip link show | grep br-
-# Сопоставь ID сети с интерфейсом br-XXXXXXXX
 ```
 
 ```bash
-# Разрешить трафик из Docker сети на relay порт
+# Разрешить трафик из Docker сети на socat relay
 # Замени br-XXXXXXXX на реальное имя интерфейса
 sudo ufw allow in on br-XXXXXXXX to 172.19.0.1 port 10800 proto tcp
 
-# Проверить
-sudo ufw status verbose | grep 10800
-```
-
-```bash
-# Финальная проверка из контейнера
-docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
-# ✓ Ожидаемо: 172.19.0.1 (172.19.0.1:10800) open
+# Проверить из контейнера
+docker exec <контейнер-3x-ui> nc -zv 172.19.0.1 10800
+# ✓ Ожидаемо: open
 ```
 
 ---
 
-### Шаг 7 — 3x-ui: Outbound + Routing Rule
+## ⚙️ Общее: Настройка 3x-ui (оба решения)
 
-#### 7.1 Добавить SOCKS5 outbound
+Конфигурация 3x-ui **одинакова** для обоих решений — адрес `DOCKER_GATEWAY:10800` не меняется.
+
+### Добавить SOCKS5 outbound
 
 **Исходящие → + Исходящие**
 
@@ -421,8 +471,7 @@ docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
 | Тег | `remote-exit` |
 | Адрес | `172.19.0.1` ← твой `DOCKER_GATEWAY` |
 | Порт | `10800` |
-| Имя пользователя | *(оставить пустым)* |
-| Пароль | *(оставить пустым)* |
+| Имя пользователя / Пароль | *(оставить пустым)* |
 
 Нажать **Создать** → **Сохранить**.
 
@@ -434,20 +483,14 @@ docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
   "tag": "remote-exit",
   "protocol": "socks",
   "settings": {
-    "servers": [
-      {
-        "address": "172.19.0.1",
-        "port": 10800,
-        "users": []
-      }
-    ]
+    "servers": [{ "address": "172.19.0.1", "port": 10800, "users": [] }]
   }
 }
 ```
 
 </details>
 
-#### 7.2 Добавить routing rule
+### Добавить routing rule
 
 **Конфигурации Xray → Маршрутизация → + Маршрутизация**
 
@@ -457,11 +500,10 @@ docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
 | Тег исходящего | выбери `remote-exit` |
 | Остальное | *(оставить пустым)* |
 
-Нажать **Создать** → **Сохранить** → Xray перезапустится автоматически.
+Нажать **Создать** → **Сохранить** → Xray перезапустится.
 
 > [!IMPORTANT]
-> Новое правило должно стоять **выше** правил `direct` и `blocked` в списке.  
-> Перетащи его вверх если нужно.
+> Новое правило должно стоять **выше** `direct` и `block` в списке правил.
 
 <details>
 <summary>JSON эквивалент</summary>
@@ -469,7 +511,7 @@ docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
 ```json
 {
   "type": "field",
-  "inboundTag": ["твой-inbound-тег"],
+  "inboundTag": ["inbound-1080"],
   "outboundTag": "remote-exit"
 }
 ```
@@ -478,139 +520,195 @@ docker exec <имя-контейнера-3x-ui> nc -zv 172.19.0.1 10800
 
 ---
 
-### Шаг 8 — Финальная проверка всей цепочки
+## ✅ Финальная проверка
 
 ```bash
-# Статус всех сервисов на основном сервере
-sudo systemctl status wg-quick@wg-server exit-relay
+# Основной сервер — все сервисы работают
+sudo systemctl status exit-relay
 
-# Состояние WireGuard туннеля
-sudo wg show wg-server
-# latest handshake: X seconds ago ✓
-# transfer: X KiB received, X KiB sent ✓
+# Только Решение А
+sudo wg show wg-server          # latest handshake: недавно ✓
 
-# Статус на узле выхода
-sudo systemctl status wg-quick@wg0 microsocks
+# Только Решение Б
+ss -tlnp | grep 10800           # 127.0.0.1:10800 LISTEN ✓
 
-# Сквозной тест — подключиться через inbound и проверить IP выхода
-curl --socks5 user:pass@YOUR_VPS_IP:PORT https://api.ipify.org
-# ✓ Должен вернуть IP узла выхода
+# Контейнер достигает relay
+docker exec <контейнер-3x-ui> nc -zv 172.19.0.1 10800   # open ✓
+
+# Сквозной тест
+curl --socks5 user:pass@YOUR_VPS_IP:INBOUND_PORT https://api.ipify.org
+# ✓ Возвращает IP Узла выхода, а не Основного сервера
 ```
 
 ---
 
 ## ♻️ Порядок запуска при ребуте
 
-Зависимости systemd выстроены правильно — всё поднимается автоматически:
+### Решение А — WireGuard
 
 ```
-Основной сервер
-│
-├── wg-quick@wg-server      ← стартует первым
-│       │ (Requires)
-│       ▼
-└── exit-relay              ← стартует только после поднятия WireGuard
-        │
-        ▼
-    Docker / 3x-ui          ← независимо, restart: unless-stopped
-
-
-Узел выхода
-│
-├── wg-quick@wg0            ← стартует первым, инициирует туннель
-│       │ (Requires)
-│       ▼
-└── microsocks              ← стартует только после поднятия WG интерфейса
+Узел выхода                        Основной сервер
+─────────────────────              ──────────────────────────────────
+wg-quick@wg0                       wg-quick@wg-server
+  │ (Requires)                       │ (Requires)
+  ▼                                  ▼
+microsocks                         exit-relay
+(10.99.0.2:10800)                  (172.19.0.1:10800 → 10.99.0.2:10800)
+                                     │
+                                     ▼
+                                   Docker 3x-ui  (restart: unless-stopped)
 ```
+
+### Решение Б — SSH Reverse Tunnel
+
+```
+Узел выхода                        Основной сервер
+─────────────────────              ──────────────────────────────────
+microsocks (127.0.0.1:10800)       sshd (всегда запущен)
+  │ (Wants)                          │ ← SSH подключение от Узла выхода
+  ▼                                  │   открывает 127.0.0.1:10800
+ssh-tunnel (autossh) ─────────────►│
+                                     ▼
+                                   exit-relay
+                                   (172.19.0.1:10800 → 127.0.0.1:10800)
+                                     │
+                                     ▼
+                                   Docker 3x-ui  (restart: unless-stopped)
+```
+
+---
+
+## 🛡️ Watchdog (рекомендуется для Решения А)
+
+WireGuard под NAT может терять сессию. Скрипт восстанавливает туннель автоматически:
+
+```bash
+# Узел выхода
+sudo tee /usr/local/bin/wg-watchdog.sh << 'EOF'
+#!/bin/bash
+LAST=$(sudo wg show wg0 latest-handshakes | awk '{print $2}')
+DIFF=$(( $(date +%s) - LAST ))
+if [ "$DIFF" -gt 180 ]; then
+    logger "wg-watchdog: handshake устарел (${DIFF}с), перезапуск"
+    systemctl restart wg-quick@wg0
+fi
+EOF
+
+sudo chmod +x /usr/local/bin/wg-watchdog.sh
+(sudo crontab -l 2>/dev/null; echo "*/2 * * * * /usr/local/bin/wg-watchdog.sh") \
+  | sudo crontab -
+```
+
+> Решение Б (SSH) не требует watchdog — autossh сам обрабатывает переподключение.
+
+---
+
+## 🔄 Миграция: WireGuard → SSH
+
+Если UDP заблокирован в сети Узла выхода — сносим WireGuard, поднимаем SSH:
+
+### Очистка на Основном сервере
+
+```bash
+sudo systemctl stop wg-quick@wg-server exit-relay
+sudo systemctl disable wg-quick@wg-server exit-relay
+sudo ip link delete wg-server 2>/dev/null || true
+sudo rm -f /etc/wireguard/wg-server.conf \
+           /etc/wireguard/server_private.key \
+           /etc/wireguard/server_public.key
+sudo rm -f /etc/systemd/system/exit-relay.service
+sudo ufw delete allow 51820/udp
+sudo systemctl daemon-reload
+```
+
+### Очистка на Узле выхода
+
+```bash
+sudo systemctl stop wg-quick@wg0 microsocks
+sudo systemctl disable wg-quick@wg0 microsocks
+sudo ip link delete wg0 2>/dev/null || true
+sudo rm -f /etc/wireguard/wg0.conf \
+           /etc/wireguard/client_private.key \
+           /etc/wireguard/client_public.key
+sudo rm -f /etc/systemd/system/microsocks.service
+sudo systemctl daemon-reload
+```
+
+После очистки следуй шагам **Б1–Б5**. UFW правило и конфигурация 3x-ui остаются без изменений.
 
 ---
 
 ## 🔧 Устранение неполадок
 
 <details>
-<summary>❌ Нет handshake в выводе <code>wg show</code></summary>
+<summary>❌ [WG] Нет handshake после нескольких минут</summary>
 
 ```bash
-# Проверить что узел выхода видит основной сервер
-ping YOUR_VPS_IP
-
-# Проверить что UDP 51820 открыт на основном сервере
+# Проверить что UDP 51820 открыт на Основном сервере
 sudo ufw status | grep 51820
 
-# Проверить конфиги на обоих машинах — ключи и endpoint
-sudo cat /etc/wireguard/wg-server.conf  # основной сервер
-sudo cat /etc/wireguard/wg0.conf        # узел выхода
+# Проверить что Узел выхода видит Основной сервер
+ping -c3 YOUR_VPS_IP
+
+# Проверить конфиги — ключи должны совпадать крест-накрест
+sudo cat /etc/wireguard/wg-server.conf   # Основной сервер
+sudo cat /etc/wireguard/wg0.conf         # Узел выхода
 
 # Перезапустить WireGuard на обоих
-sudo systemctl restart wg-quick@wg-server  # основной сервер
-sudo systemctl restart wg-quick@wg0        # узел выхода
+sudo systemctl restart wg-quick@wg-server   # Основной сервер
+sudo systemctl restart wg-quick@wg0         # Узел выхода
 ```
 
 </details>
 
 <details>
-<summary>❌ <code>curl --socks5 10.99.0.2:10800</code> не работает с основного сервера</summary>
+<summary>❌ [WG] Handshake есть, но curl зависает (tcpdump показывает 0 пакетов)</summary>
+
+Сеть блокирует **входящий UDP**. Узел выхода может отправлять пакеты, но не получать ответы.  
+→ **Мигрируй на Решение Б (SSH).**
+
+</details>
+
+<details>
+<summary>❌ [SSH] 127.0.0.1:10800 не слушает на Основном сервере</summary>
 
 ```bash
-# Проверить статус microsocks на узле выхода
-sudo systemctl status microsocks
-sudo journalctl -u microsocks -n 30
+# Проверить статус ssh-tunnel на Узле выхода
+sudo systemctl status ssh-tunnel
+sudo journalctl -u ssh-tunnel -n 30
 
-# Проверить что microsocks слушает на WG интерфейсе
-ss -tlnp | grep 10800
-# Должно быть: 10.99.0.2:10800 — НЕ 0.0.0.0 и НЕ 127.0.0.1
+# Проверить SSH вручную с Узла выхода
+ssh -i ~/.ssh/entry_tunnel -N -R 10800:127.0.0.1:10800 ubuntu@YOUR_VPS_IP
+# Если ошибка — проверить authorized_keys на Основном сервере
 
-# Если слушает на неправильном адресе — исправить сервис:
-sudo nano /etc/systemd/system/microsocks.service
-# ExecStart=/usr/bin/microsocks -i 10.99.0.2 -p 10800
-sudo systemctl daemon-reload && sudo systemctl restart microsocks
+cat ~/.ssh/authorized_keys | grep -c "ssh-"   # должно быть >= 1
 ```
 
 </details>
 
 <details>
-<summary>❌ <code>nc -zv DOCKER_GATEWAY 10800</code> возвращает "Host is unreachable" из контейнера</summary>
+<summary>❌ nc -zv DOCKER_GATEWAY 10800 возвращает "Host is unreachable" из контейнера</summary>
 
 ```bash
-# UFW блокирует — добавить правило из Шага 6
-# Сначала найти bridge интерфейс
-ip link show | grep br-
-docker network inspect <имя-сети> | grep Subnet
-
-# Добавить разрешение
+# Не хватает UFW правила — добавить
 sudo ufw allow in on br-XXXXXXXX to DOCKER_GATEWAY port 10800 proto tcp
+
+# Проверить
+docker exec <контейнер> nc -zv DOCKER_GATEWAY 10800
 ```
 
 </details>
 
 <details>
-<summary>❌ socat relay не запускается</summary>
-
-```bash
-sudo systemctl status exit-relay
-sudo journalctl -u exit-relay -n 30
-
-# Частая причина: WireGuard не поднят, нет маршрута к 10.99.0.2
-ping 10.99.0.2
-sudo wg show wg-server
-
-# Сначала поднять WireGuard, потом relay
-sudo systemctl restart wg-quick@wg-server
-sudo systemctl restart exit-relay
-```
-
-</details>
-
-<details>
-<summary>❌ Трафик всё равно выходит через IP основного сервера</summary>
+<summary>❌ curl возвращает IP Основного сервера вместо Узла выхода</summary>
 
 ```bash
 # Проверить порядок правил в 3x-ui
 # Конфигурации Xray → Маршрутизация
-# Правило inbound → remote-exit должно стоять ВЫШЕ direct и blocked
+# Правило с нужным inbound → remote-exit должно стоять ВЫШЕ direct и block
 
-# Проверить что outbound указывает на DOCKER_GATEWAY, а не на 10.99.0.2
-# (Xray контейнер не может напрямую достучаться до 10.99.0.2 — для этого и нужен socat relay)
+# Адрес outbound должен быть DOCKER_GATEWAY, а не 10.99.0.2 или 127.0.0.1
+# Контейнер Xray не имеет к ним прямого доступа — для этого и нужен socat relay
 ```
 
 </details>
@@ -619,33 +717,34 @@ sudo systemctl restart exit-relay
 
 ## ❓ Частые вопросы
 
-**Q: Можно ли использовать другой протокол вместо SOCKS5 для outbound?**  
-A: Да. Как только WireGuard туннель поднят, на узле выхода можно запустить любой прокси (Xray VLESS, Shadowsocks, HTTP proxy и т.д.) и использовать соответствующий протокол outbound в 3x-ui. SOCKS5 через `microsocks` рекомендуется за простоту — это один бинарник без конфигурационных файлов.
+**Q: Можно добавить несколько Узлов выхода с разными inbound?**  
+A: Да. Каждый Узел выхода получает свой туннель (WG peer или SSH на другом порту), свой socat relay (другой порт биндинга), свой outbound и routing rule в 3x-ui.
 
-**Q: Что если узел выхода перезагрузится и получит другой IP?**  
-A: Всё работает. Узел выхода сам подключается к фиксированному IP основного сервера. WireGuard восстанавливает handshake как только узел выходит в онлайн. `PersistentKeepalive = 25` гарантирует восстановление туннеля в течение ~25 секунд.
+**Q: Можно использовать другой протокол вместо SOCKS5?**  
+A: Да. Как только туннель поднят, на Узле выхода можно запустить любой прокси (Xray VLESS, Shadowsocks, HTTP CONNECT и т.д.) и использовать соответствующий outbound в 3x-ui. microsocks рекомендуется за простоту — один бинарник без конфигурационных файлов.
 
-**Q: Можно ли добавить несколько узлов выхода?**  
-A: Да. Добавь новый блок `[Peer]` в `wg-server.conf` с другим `AllowedIPs` (например `10.99.0.3/32`), запусти microsocks + socat на каждом узле, создай отдельные outbound и routing rules в 3x-ui.
+**Q: Работает ли это без Docker (Xray как systemd)?**  
+A: Да, и проще. Пропусти socat relay и UFW шаг — укажи outbound напрямую на `10.99.0.2:10800` (WG) или `127.0.0.1:10800` (SSH) в конфиге Xray.
 
-**Q: Почему socat relay, а не `network_mode: host` в Docker?**  
-A: Оба варианта работают. `socat` relay — минимальное изменение, не требует правки docker-compose. `network_mode: host` архитектурно чище (контейнер напрямую видит WireGuard интерфейс), но требует изменения compose файла и удаления секции `ports:`.
-
-**Q: Работает ли это без Docker (Xray запущен как systemd)?**  
-A: Да, и даже проще. Пропусти шаги с socat relay и UFW правилом — укажи SOCKS5 outbound напрямую на `10.99.0.2:10800` в конфиге Xray.
+**Q: Узел выхода перезагрузился и получил другой IP — туннель сломается?**  
+A: Нет. Узел выхода всегда сам подключается к фиксированному IP Основного сервера. Туннель восстанавливается автоматически в течение нескольких секунд.
 
 ---
 
-## 📁 Итоговая карта файлов
+## 📁 Карта файлов
 
 ```
 Основной сервер
-├── /etc/wireguard/wg-server.conf              конфиг WireGuard сервера
-├── /etc/systemd/system/exit-relay.service     socat relay сервис
+├── /etc/systemd/system/exit-relay.service    socat relay (оба решения)
+├── /etc/wireguard/wg-server.conf             конфиг WireGuard сервера (Решение А)
+└── ~/.ssh/authorized_keys                    ключ Узла выхода (Решение Б)
 
 Узел выхода
-├── /etc/wireguard/wg0.conf                    конфиг WireGuard клиента
-├── /etc/systemd/system/microsocks.service     microsocks сервис
+├── /etc/systemd/system/microsocks.service    microsocks SOCKS5 прокси
+├── /etc/wireguard/wg0.conf                   конфиг WireGuard клиента (Решение А)
+├── /usr/local/bin/wg-watchdog.sh             watchdog скрипт (Решение А)
+├── /etc/systemd/system/ssh-tunnel.service    autossh туннель (Решение Б)
+└── ~/.ssh/entry_tunnel                        SSH приватный ключ (Решение Б)
 ```
 
 ---
